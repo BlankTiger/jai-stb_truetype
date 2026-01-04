@@ -4,7 +4,10 @@
 
 AT_COMPILE_TIME :: true;
 
-SOURCE_PATH   :: "source";
+PS5_SUPPORT      :: false;
+NINTENDO_SUPPORT :: #run to_string(getenv("NINTENDO_SDK_ROOT")) != "";
+
+SOURCE_PATH :: "source";
 LIB_BASE_NAME :: "stb_truetype";
 
 #if AT_COMPILE_TIME {
@@ -28,7 +31,10 @@ LIB_BASE_NAME :: "stb_truetype";
 }
 
 generate_bindings :: (args: [] string, minimum_os_version: type_of(Build_Options.minimum_os_version)) -> bool {
+    using BG;
     target_android := array_find(args, "-android");
+    target_switch2 := array_find(args, "-switch2");
+    target_ps5     := array_find(args, "-ps5");
     target_x64     := array_find(args, "-x64");
     target_arm     := array_find(args, "-arm64");
     compile        := array_find(args, "-compile");
@@ -37,9 +43,13 @@ generate_bindings :: (args: [] string, minimum_os_version: type_of(Build_Options
     os_target  := OS;
     cpu_target := CPU;
     if target_android os_target  = .ANDROID;
+    if target_switch2 os_target  = .NN_SWITCH2;
+    if target_ps5     os_target  = .PS5;
+
     if target_x64     cpu_target = .X64;
     if target_arm     cpu_target = .ARM64;
 
+    build_dynamic_lib := true;
     lib_directory: string;
     if os_target == {
         case .WINDOWS;
@@ -51,7 +61,11 @@ generate_bindings :: (args: [] string, minimum_os_version: type_of(Build_Options
         case .ANDROID;
             lib_directory = ifx cpu_target == .X64 then "android/x64" else "android/arm64";
         case .PS5;
+            build_dynamic_lib = false;
             lib_directory = "ps5";
+        case .NN_SWITCH2;
+            build_dynamic_lib = false;
+            lib_directory = "switch2";
         case;
             assert(false);
     }
@@ -63,37 +77,22 @@ generate_bindings :: (args: [] string, minimum_os_version: type_of(Build_Options
         lib_path := tprint("%/%", lib_directory, LIB_BASE_NAME);
         success := true;
         if os_target == .MACOS {
-            lib_path_x64   := tprint("%_x64", lib_path);
-            lib_path_arm64 := tprint("%_arm64", lib_path);
-            macos_x64_version_arg   := "-mmacos-version-min=10.13"; // Our current x64 min version
-            macos_arm64_version_arg := "-mmacos-version-min=11.0";  // Earliest version that supports arm64
-            // x64 variant
-            success &&= build_cpp_dynamic_lib(lib_path_x64,   source_file, extra = .["-arch", "x86_64", macos_x64_version_arg],   debug=compile_debug);
-            success &&= build_cpp_static_lib( lib_path_x64,   source_file, extra = .["-arch", "x86_64", macos_x64_version_arg],   debug=compile_debug);
-            // arm64 variant
-            success &&= build_cpp_dynamic_lib(lib_path_arm64, source_file, extra = .["-arch", "arm64",  macos_arm64_version_arg], debug=compile_debug);
-            success &&= build_cpp_static_lib( lib_path_arm64, source_file, extra = .["-arch", "arm64",  macos_arm64_version_arg], debug=compile_debug);
-            // create universal binaries
-            run_result := run_command("lipo", "-create", tprint("%.dylib", lib_path_x64), tprint("%.dylib", lib_path_arm64), "-output", tprint("%.dylib", lib_path));
-            success &&= (run_result.exit_code == 0);
-            run_result  = run_command("lipo", "-create", tprint("%.a",     lib_path_x64), tprint("%.a",     lib_path_arm64), "-output", tprint("%.a",     lib_path));
-            success &&= (run_result.exit_code == 0);
+            success &&= Build_Cpp.build_universal_macos_binary(lib_path, source_file, type = .DYNAMIC_LIBRARY, debug = compile_debug);
+            success &&= Build_Cpp.build_universal_macos_binary(lib_path, source_file, type = .STATIC_LIBRARY,  debug = compile_debug);
         } else {
             extra: [..] string;
             if os_target == .ANDROID {
                 _, target_triple_with_sdk := get_android_target_triple(cpu_target);
                 array_add(*extra, "-target", target_triple_with_sdk);
             }
-            if os_target == .WINDOWS {
-                array_add(*extra, "-DSTBI_WINDOWS_UTF8");
-            } else {
+            if os_target != .WINDOWS {
                 array_add(*extra, "-fPIC");
             }
 
-            if os_target != .PS5 {
-                success &&= build_cpp_dynamic_lib(lib_path, source_file, target = os_target, debug = compile_debug, extra = extra);
+            if build_dynamic_lib {
+                success &&= Build_Cpp.build_cpp_dynamic_lib(lib_path, source_file, target = os_target, debug = compile_debug, extra = extra);
             }
-            success &&= build_cpp_static_lib(lib_path, source_file, target = os_target, debug = compile_debug, extra = extra);
+            success &&= Build_Cpp.build_cpp_static_lib(lib_path, source_file, target = os_target, debug = compile_debug, extra = extra);
         }
 
         if !success     return false;
@@ -111,7 +110,6 @@ generate_bindings :: (args: [] string, minimum_os_version: type_of(Build_Options
         array_add(*typedef_prefixes_to_unwrap, "stbtt_");
         array_add(*strip_prefixes, "stbtt_");
         array_add(*strip_prefixes, "STBTT_");
-
 
         generate_library_declarations = false;
         footer = tprint(FOOTER_TEMPLATE, LIB_BASE_NAME);
@@ -141,6 +139,12 @@ FOOTER_TEMPLATE :: #string END
     }
 } else #if OS == .PS5 {
     %1 :: #library "ps5/%1";
+} else #if OS == .NN_SWITCH2 {
+    #if CPU == .X64 {
+        %1 :: #library "windows/%1";
+    } else #if CPU == .ARM64 {
+        %1 :: #library "switch2/%1";
+    }
 } else {
     #assert false;
 }
@@ -148,10 +152,14 @@ FOOTER_TEMPLATE :: #string END
 END
 
 #import "Basic";
-#import "Bindings_Generator";
-#import "BuildCpp";
+BG :: #import "Bindings_Generator"(NINTENDO_SUPPORT = NINTENDO_SUPPORT);
+Build_Cpp :: #import "BuildCpp"()(PS5_SUPPORT = PS5_SUPPORT, NINTENDO_SUPPORT = NINTENDO_SUPPORT);
 #import "Compiler";
 #import "File";
-#import "Process";
-#import "Toolchains/Android";
-#import "String";
+#import "Android/Toolchain";
+#if OS == .WINDOWS {
+    #import "Windows";
+} else {
+    #import "POSIX";
+}
+
